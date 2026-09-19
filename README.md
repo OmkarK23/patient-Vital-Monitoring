@@ -104,6 +104,12 @@ python streaming_medallion_pipeline.py
 
 The pipeline runs as a continuous streaming Dataflow job — monitor it in the [GCP Console](https://console.cloud.google.com/dataflow) and cancel it when done, since streaming jobs bill by the hour until stopped.
 
+## Dashboard
+
+![Power BI Dashboard](./Dashboard.png)
+
+The `.pbix` file (`Patient_Vital_Monitoring.pbix`) is also included in this repo — download it and open in Power BI Desktop to explore the underlying model and queries directly.
+
 ## Known limitations
 
 - Vitals are synthetic, generated within plausible ranges rather than sourced from real monitoring hardware.
