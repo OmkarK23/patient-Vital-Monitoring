@@ -15,7 +15,9 @@ Continuous patient vitals — heart rate, SpO2, temperature, blood pressure — 
 | **Vitals Simulator** | Python script publishing synthetic patient vitals (heart rate, SpO2, temperature, blood pressure) to Pub/Sub every few seconds, with a configurable error-injection rate (missing fields, out-of-range values) to exercise the validation logic downstream. |
 | **Streaming Pipeline** | Apache Beam pipeline on Dataflow, reading from a Pub/Sub subscription in 60-second fixed windows, running continuously (not a scheduled batch job). |
 | **Bronze Layer** | Raw, unmodified messages written to GCS — the system of record for what was actually received, before any filtering. |
-| **Silver Layer** | Records parsed, filtered against range checks (heart rate, SpO2, temperature bounds), and enriched with a computed risk score and risk level. |
+| **Data Quality Gate** | Every message is checked against 12 documented rules (completeness, validity, consistency, timeliness) defined in one file, [`dataflow/quality_rules.py`](./dataflow/quality_rules.py). |
+| **Quarantine** | Records that fail a rule are written to GCS with the original message and every failure reason, instead of being dropped silently. |
+| **Silver Layer** | Records that passed the quality gate, enriched with a computed risk score and risk level, written as JSON lines. |
 | **Gold Layer** | Silver records aggregated per patient per window (average vitals, worst risk level observed) and written to BigQuery. |
 | **Power BI Dashboard** | Live/near-real-time visuals over the Gold table — risk distribution, per-patient vitals, and top-line KPIs. |
 
@@ -33,6 +35,55 @@ Being direct about this, since it's a portfolio/learning project and the data is
 
 This is a reasonable first-pass heuristic, not a clinically validated triage score — swapping in a real scoring model (or clinician-defined thresholds) would be a drop-in replacement at the `enrich_record` step without touching the rest of the pipeline.
 
+## Data governance
+
+Full field definitions, sensitivity classification, and ownership roles are in the [data dictionary](./docs/data_dictionary.md).
+
+### Data quality rules
+
+The pipeline originally used one filter function that dropped bad records without saying why or how many. That filter also never checked `timestamp` or blood pressure, so some bad records reached Silver. It is now a rule set where each rule has an ID, a data quality dimension, and a severity:
+
+| Dimension | Rules | What they catch |
+|---|---|---|
+| Completeness | DQ-01 | Missing or null required fields |
+| Validity | DQ-00, DQ-02 to DQ-09 | Unparseable messages, non-numeric vitals, bad patient ID or timestamp format, out-of-range vitals |
+| Consistency | DQ-10 | Systolic pressure not above diastolic |
+| Timeliness | DQ-11, DQ-12 | Timestamps in the future (quarantined) or older than 24 hours (flagged, kept) |
+
+The ranges catch data errors such as sensor faults and malformed payloads, not clinical alerts. Clinically abnormal but real readings still reach risk scoring.
+
+### Results
+
+Measured on 10,000 simulated records with the simulator's default 10% error rate (`python tools/data_quality_report.py --records 10000 --seed 42`):
+
+| | Original filter | Quality rules |
+|---|---|---|
+| Injected errors that reached Silver | 47 of 1,036 (4.5%), all missing timestamps | 0 of 1,036 |
+| Clean records wrongly rejected | 0 | 0 |
+
+The simulator only injects three kinds of error (missing field, negative heart rate, SpO2 of 150). The other rules are covered by unit tests in [`tests/`](./tests/).
+
+### Monitoring
+
+The quality gate publishes Beam counters under the `data_quality` namespace (`records_in`, `records_valid`, `records_quarantined`, and `failed_DQ-xx` per rule). They appear under the job's custom counters in the Dataflow console, so a spike in one rule is visible without querying the data.
+
+### Sensitive data handling
+
+The data is synthetic, but the pipeline is designed as if it carried PHI. `patient_id`, `timestamp`, and the vital signs are classified as PHI, and the computed risk fields as derived PHI (see the data dictionary).
+
+**In place now:**
+- Quarantined records stay in the same controlled bucket as Bronze and Silver, not in logs or email alerts.
+- The Dataflow worker runs as a service account with specific roles (listed under Setup) instead of personal credentials.
+- Data at rest in GCS and BigQuery is encrypted by default by Google Cloud.
+
+**Needed before this could carry real PHI:**
+- A Business Associate Agreement (BAA) with Google Cloud, and confirmation that every service used is covered by it.
+- IAM roles scoped to the specific buckets and dataset rather than the whole project, with separate access for Bronze/Quarantine (raw PHI) and Gold (analytics).
+- BigQuery column-level security (policy tags) on `patient_id`, and row-level security so care teams only see their own patients.
+- Tokenizing `patient_id` before the Gold layer (for example with Sensitive Data Protection), so the dashboard never shows a real identifier.
+- Data Access audit logs turned on, so every read of PHI is recorded.
+- Retention rules: GCS lifecycle policies on Bronze and Quarantine, and table or partition expiration in BigQuery, set by the data owner's retention policy.
+
 ## Tech stack
 
 - **Ingestion:** Google Cloud Pub/Sub
@@ -40,6 +91,7 @@ This is a reasonable first-pass heuristic, not a clinically validated triage sco
 - **Storage (Bronze/Silver):** Google Cloud Storage
 - **Storage (Gold):** Google BigQuery
 - **Visualization:** Power BI
+- **Data quality:** rule-based checks in Apache Beam, pytest
 - **Language:** Python
 - **Infra & Auth:** GCP IAM, Cloud Shell
 
@@ -53,6 +105,8 @@ Simulator (Python)
                             └── Pub/Sub Subscription
                                   └── Dataflow (Apache Beam, streaming)
                                         ├── Bronze  → GCS (raw)
+                                        ├── Quality gate (12 rules)
+                                        │     └── failed → GCS quarantine (with reasons)
                                         ├── Silver  → GCS (validated + risk-enriched)
                                         └── Gold    → BigQuery (aggregated per patient)
                                                           └── Power BI (live dashboard)
@@ -82,6 +136,7 @@ GCP_PROJECT=your-project-id
 PUBSUB_SUBSCRIPTION=projects/your-project-id/subscriptions/patient_vitals_stream-sub
 BRONZE_PATH=gs://your-bucket/bronze/
 SILVER_PATH=gs://your-bucket/silver/
+QUARANTINE_PATH=gs://your-bucket/quarantine/   # optional, this is the default
 BIGQUERY_TABLE=your-project-id.healthcare.patient_risk_analytics
 TEMP_LOCATION=gs://your-bucket/temp/
 STAGING_LOCATION=gs://your-bucket/staging/
@@ -100,6 +155,18 @@ python patient_vitals_simulator.py
 # Terminal 2 — start the streaming pipeline
 cd dataflow
 python streaming_medallion_pipeline.py
+```
+
+`dataflow/setup.py` ships `quality_rules.py` to the Dataflow workers, so run the pipeline from the `dataflow/` folder as shown.
+
+### Test the data quality rules locally
+
+No GCP account needed:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests
+python tools/data_quality_report.py --records 10000 --seed 42
 ```
 
 The pipeline runs as a continuous streaming Dataflow job — monitor it in the [GCP Console](https://console.cloud.google.com/dataflow) and cancel it when done, since streaming jobs bill by the hour until stopped.
